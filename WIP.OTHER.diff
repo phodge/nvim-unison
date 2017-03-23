@@ -1,0 +1,292 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..527e9bf
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,24 @@
++UNISON
++======
++
++Requirements
++------------
++
++Neovim >= 0.1.6 with the LiveUpdates feature patched in.
++
++
++Installation
++------------
++
++Install with your favourite plugin manager.
++
++Usage
++-----
++
++Open the same file in two instances of neovim. They will send the changes back and forth to each other.
++
++Customisation
++-------------
++
++Add `%{unison#isactive()?'[U]':''}` to your statusline to get `[U]` in your
++status line when Unison plugin is active for the current file.
+diff --git a/rplugin/python3/unison.py b/rplugin/python3/unison.py
+new file mode 100644
+index 0000000..ecdbf8b
+--- /dev/null
++++ b/rplugin/python3/unison.py
+@@ -0,0 +1,256 @@
++import os
++from functools import partial
++from os.path import join
++
++import neovim
++
++
++@neovim.plugin
++class Unison(object):
++    _mysock = None
++    _pid = None
++
++    def __init__(self, vim):
++        self.vim = vim
++        self._servers = {}
++
++    def _setup(self):
++        #  don't redo things that have already been done
++        if self._pid is not None:
++            return
++        # find out the current nvim's PID
++        self._pid = self.vim.call('getpid')
++        # create our Unison augroup now
++        self.vim.command('augroup Unison')
++        self.vim.command('augroup end')
++        # TODO: this is no good - every time we call :UpdateRemotePlugins, a new instance of the
++        # class gets created and we might re-listen on the same socket again
++        if self._configure():
++            self._checkserver()
++
++    def _log(self, message):
++        with open(join(os.environ['HOME'], '.nvimlog'), 'a') as f:
++            f.write('unison[%r]: ' % self._pid)
++            f.write(message)
++            f.write('\n')
++
++    def _configure(self):
++        """Try and find a folder where we can put nvim's server sockets.
++
++        Sets self._sockdir when successful, otherwise calls self._seterror()
++        """
++        datadir = os.environ.get('XDG_DATA_HOME', None)
++        if not datadir:
++            datadir = join(os.environ['HOME'], '.config')
++        if not os.path.exists(datadir):
++            self._seterror(None, "XDG_DATA_HOME '{}' does not exist".format(datadir))
++            return False
++
++        nvimdir = join(datadir, 'nvim')
++        if not os.path.exists(nvimdir):
++            self._seterror(None, "nvim data dir '{}' does not exist".format(nvimdir))
++            return False
++
++        sockdir = join(nvimdir, 'servers')
++        if not os.path.exists(sockdir):
++            os.mkdir(sockdir)
++        self._sockdir = sockdir
++        return True
++
++    def _checkserver(self):
++        self._mysock = join(self._sockdir, 'nvim.{}.sock'.format(self._pid))
++
++        # see if we're already listening on this socket
++        if self._mysock in self.vim.call('serverlist'):
++            return
++
++        if os.path.exists(self._mysock):
++            os.unlink(self._mysock)
++        """open a socket in self._sockdir to listen for other neovims"""
++        self.vim.call('serverstart', self._mysock)
++
++    def _seterror(self, buf, message):
++        if buf is None:
++            self.vim.api.set_var('unison#globalerror', message)
++        else:
++            buf.api.set_var('unison_status',
++                            ("ERROR: %s" % message) if message else '')
++
++    def _getothersocks(self):
++        for thing in os.listdir(self._sockdir):
++            if thing.startswith('nvim.') and thing.endswith('.sock'):
++                pid = thing[5:-5]
++            if pid.isnumeric() and int(pid) != self._pid:
++                yield int(pid), join(self._sockdir, thing)
++
++    @neovim.autocmd('VimEnter', pattern='*', eval='expand("<afile>")',
++                    sync=True)
++    def vimenter(self, *args):
++        self._setup()
++
++    @neovim.autocmd('SwapExists', pattern='*', eval='expand("<afile>:p")',
++                    sync=True)
++    def autocmd_handler(self, filename):
++        """
++        Try and edit in unison I guess?
++        """
++        self._setup()
++        for pid, sock in self._getothersocks():
++            self._log("Talk to %d" % pid)
++            # ask the other nvim if it owns that file
++            try:
++                othervim = neovim.attach('socket', path=sock)
++            except ConnectionRefusedError:
++                self._log("Ignoring unresponsive socket {}".format(sock))
++                continue
++            try:
++                result = othervim.call('UnisonAreYouServingFile',
++                                       filename, self._pid)
++            # FIXME: we should be more targeted with the types of exceptions we
++            # catch here ...
++            except Exception:
++                # NOTE: this should be logged somewhere ...
++                self._log('encountered an error when asking %d'
++                          ' if it controls %s' % (pid, filename))
++                continue
++            if result:
++                self._log("neovim [%d] wants to serve %s" % (pid, filename))
++                # the other instance of vim has agreed to share changes with us
++                # get ready to become a client of this file
++                bufnr = self.vim.call('bufnr', filename)
++                self._becomeclient(bufnr, filename, pid, othervim)
++                # finally, ignore the swapfile
++                self.vim.command('let v:swapchoice = "e"')
++                self.vim.command('setlocal noswapfile')
++                return
++
++            self._log("Other nvim[%d] is _not_ serving that file" % pid)
++
++        self._log("No other nvim is serving that file!")
++
++    @neovim.function('UnisonAreYouServingFile', sync=True)
++    def funchandler(self, args):
++        # do we have a bufnr for that file?
++        filename, clientpid = args[:2]
++        bufnr = self.vim.call('bufnr', filename)
++        if bufnr < 0:
++            return False
++
++        # if our buffer isn't loaded, then we aren't serving that file
++        if not self.vim.call('bufloaded', bufnr):
++            return False
++
++        self._log('need to start serving %d:%s' % (bufnr, filename))
++        self.vim.buffers[bufnr].api.set_var('unison_status', 'SERVING')
++        return True
++
++    '''
++    @neovim.function('unison#BecomeServer')
++    def becomeserver(self, args):
++        # TODO: another neovim wants to edit the specified file in unison mode
++        # we need to become the server:
++        # - add the other neovim to our list of neovims
++        # - activate LiveUpdates to send any buffer changes out to the other
++        #   neovims using unison#changefromserver()
++        # - add a BufWritePost autocmd that tells the clients to mark their
++        #   buffer nomodified
++        # - add a BufUnload autocmd that tells one of the clients to become the
++        #   server
++        pass
++    '''
++
++    '''
++    @neovim.function('unison#changefromserver')
++    def changefromserver(self, args):
++        # TODO: this gets called when the unison server is broadcasting a
++        # change to the buffer contents
++        pass
++
++    # TODO: add a SwapExists autocommand to activate unison mode for the
++    # current buffer
++    @neovim.autocmd('SwapExists')
++    def swapexists(self):
++        # TODO: try and connect to the nvim instance that owns this file
++        # TODO: activate unison mode on the owner by calling
++        # unison#becomeserver() on it
++        self.becomeclient(self.vim.current_buffer)
++        # TODO: tell neovim to edit the file anyway by setting v:swapchoice,
++        # but then set noswapfile to make sure another swapfile doesn't get
++        # created
++    '''
++
++    @neovim.function('UnisonClientSavesFile', sync=True)
++    def UnisonClientSavesFile(self, args):
++        bufnr = args[0]
++        buf = self.vim.buffers[bufnr]
++        buf.api.set_var('unison_status', 'Writing ...')
++        self.vim.command('redraw!')
++        try:
++            raise Exception("TODO: finish this")  # noqa
++            # find the socket for the owner
++            # connect to the owner's socket
++            # call UnisonServerSaveFile() on the server, maybe the server gives
++            # an error back to us?
++            pass
++        except:
++            self._seterror(self.vim.buffers[bufnr],
++                           "Server did not write the file")
++            return
++        self._seterror(self.vim.buffers[bufnr], "BIG BANG")
++        self.vim.command('redraw!')
++        # success!
++        import time
++        time.sleep(3)
++        self._seterror(buf, '')
++
++    def _becomeclient(self, bufnr, filename, serverpid, servervim):
++        # remember which vim 
++        self.vim.command('au! Unison BufWriteCmd <buffer>'
++                         ' call UnisonClientSavesFile(bufnr(""))')
++        assert bufnr not in self._servers
++        self._servers[bufnr] = serverpid
++
++        # TODO: add handler for LiveUpdate which sends changes up to the server
++        clientbuf = self.vim.buffers[bufnr]
++        serverbuf = servervim.buffers[bufnr]
++
++        serverbuf.live_updates(
++            start=partial(self.bufinit, clientbuf),
++            edit=partial(self.bufchanged, clientbuf),
++            tick=partial(self.buftick, clientbuf),
++            end=partial(self.bufunloaded, clientbuf),
++        )
++
++        # tell the server we also want to receive updates via our
++        # UnisonHereAreSomeChanges function
++        clientbuf.live_updates(
++            start=partial(self.localbufinit, serverbuf),
++            edit=partial(self.localbufchanged, serverbuf),
++            tick=partial(self.localbuftick, serverbuf),
++            end=partial(self.localbufunloaded, serverbuf),
++        )
++
++        # set the current status to CLIENT:<PID>
++        clientbuf.api.set_var('unison_status',
++                              'CLIENT:%d' % serverpid)
++
++    # hooks for LiveUpdate stuff
++    @staticmethod
++    def bufinit(clientbuf, serverbuf, changedtick, lines, more):
++        raise Exception("TODO: update our buffer contents to relect what's in the other buffer")  # noqa
++
++    @staticmethod
++    def bufchanged(clientbuf,
++                   serverbuf,
++                   changedtick,
++                   firstline,
++                   linesremoved,
++                   numadded):
++        raise Exception("TODO: apply the change in our own copy of the buffer")  # noqa
++
++    def bufunloaded(clientbuf, serverbuf):
++        raise Exception("TODO: turn off live updates for it I guess")  # noqa
++
++
++    # TODO: we need a handler such that if the user uses :file to change the
++    # buffer name, we stop being a client, or stop being a server
